@@ -1,5 +1,6 @@
 import typer
 
+from .mail import app as mail
 from .migrate import app as migrate
 
 app = typer.Typer(
@@ -8,6 +9,7 @@ app = typer.Typer(
 )
 
 app.add_typer(migrate, name="migrate")
+app.add_typer(mail, name="mail")
 
 
 @app.callback()

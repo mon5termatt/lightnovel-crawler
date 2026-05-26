@@ -1,6 +1,8 @@
 from email.mime.text import MIMEText
 import logging
-from smtplib import SMTP
+from smtplib import SMTP, SMTP_SSL, SMTPException
+import ssl
+import threading
 from typing import Optional
 
 import lxml.etree
@@ -9,26 +11,41 @@ import lxml.html
 from ..assets import emails
 from ..context import ctx
 from ..dao import Job, JobStatus, User
-from ..exceptions import ServerErrors
+from ..exceptions import ServerError, ServerErrors
 from ..utils.file_tools import format_size
 
 logger = logging.getLogger(__name__)
 
 
+# Common implicit-TLS ("SMTPS") submission port.
+_IMPLICIT_TLS_PORT = 465
+
+
 class MailService:
     def __init__(self) -> None:
         self.server: Optional[SMTP] = None
-        self.sender = ctx.config.mail.smtp_sender or ctx.config.mail.smtp_username
+        # smtplib's SMTP object is not thread-safe; serialize all access.
+        self._lock = threading.Lock()
 
-    def close(self):
-        if self.server:
-            self.server.close()
+    @property
+    def sender(self) -> str:
+        """Resolve the From address each time so admin config edits are picked up live."""
+        return ctx.config.mail.smtp_sender or ctx.config.mail.smtp_username
+
+    def close(self) -> None:
+        if self.server is None:
+            return
+        try:
+            self.server.quit()
+        except Exception:
+            try:
+                self.server.close()
+            except Exception:
+                pass
+        finally:
             self.server = None
 
-    def prepare(self):
-        if self.server:
-            return
-
+    def _connect(self) -> SMTP:
         smtp_server = ctx.config.mail.smtp_server
         smtp_port = ctx.config.mail.smtp_port
         smtp_user = ctx.config.mail.smtp_username
@@ -36,35 +53,88 @@ class MailService:
         if not all([smtp_server, smtp_port, smtp_user, smtp_pass]):
             raise ServerErrors.smtp_server_unavailable
 
+        use_implicit_tls = smtp_port == _IMPLICIT_TLS_PORT
+        logger.info(
+            "Connecting to SMTP %s:%s as %s (%s)",
+            smtp_server,
+            smtp_port,
+            smtp_user,
+            "implicit TLS" if use_implicit_tls else "STARTTLS",
+        )
+
         try:
-            logger.info("Preparing mail server")
-            self.server = SMTP(smtp_server, smtp_port)
-            self.server.starttls()
-            self.server.login(smtp_user, smtp_pass)
-            logger.info(f"Connected with SMTP server: {smtp_server}")
+            tls_ctx = ssl.create_default_context()
+            if use_implicit_tls:
+                server: SMTP = SMTP_SSL(smtp_server, smtp_port, timeout=30, context=tls_ctx)
+                server.ehlo()
+            else:
+                server = SMTP(smtp_server, smtp_port, timeout=30)
+                server.ehlo()
+                if server.has_extn("starttls"):
+                    server.starttls(context=tls_ctx)
+                    server.ehlo()
+                else:
+                    logger.warning(
+                        "SMTP server %s does not advertise STARTTLS; "
+                        "credentials will be sent in plaintext.",
+                        smtp_server,
+                    )
+            server.login(smtp_user, smtp_pass)
+            logger.info("Connected with SMTP server: %s", smtp_server)
+            return server
+        except ServerError:
+            raise
         except Exception as e:
-            self.close()
+            logger.exception("SMTP login failed for %s:%s as %s", smtp_server, smtp_port, smtp_user)
             raise ServerErrors.smtp_server_login_fail from e
 
-    def send(self, email: str, subject: str, html_body: str):
-        # Prepare mail server
-        self.prepare()
+    def _is_alive(self) -> bool:
+        if not self.server:
+            return False
+        try:
+            return self.server.noop()[0] == 250
+        except Exception:
+            return False
 
-        # Minify HTML
+    def prepare(self) -> None:
+        """Ensure ``self.server`` points at a live, authenticated SMTP session."""
+        if self._is_alive():
+            return
+        if self.server is not None:
+            self.close()
+        self.server = self._connect()
+
+    def send(self, email: str, subject: str, html_body: str) -> None:
         tree = lxml.html.fromstring(html_body)
         minified = lxml.etree.tostring(tree, encoding="unicode", pretty_print=False)
 
-        # Create mail body
         msg = MIMEText(minified, "html")
         msg["Subject"] = subject
         msg["From"] = self.sender
         msg["To"] = email
 
-        try:
-            assert self.server
-            self.server.sendmail(msg["From"], [msg["To"]], msg.as_string())
-        except Exception as e:
-            raise ServerErrors.email_send_failure from e
+        with self._lock:
+            self.prepare()
+            try:
+                assert self.server is not None
+                self.server.sendmail(msg["From"], [msg["To"]], msg.as_string())
+                logger.info("Sent email to %s (subject=%r)", email, subject)
+                return
+            except (SMTPException, ConnectionError, OSError) as e:
+                # Connection may have gone stale between noop() and sendmail(); reconnect once.
+                logger.warning("SMTP send failed (%s); retrying with a fresh connection.", e)
+                self.close()
+
+            try:
+                self.prepare()
+                assert self.server is not None
+                self.server.sendmail(msg["From"], [msg["To"]], msg.as_string())
+                logger.info("Sent email to %s on retry (subject=%r)", email, subject)
+            except ServerError:
+                raise
+            except Exception as e:
+                logger.exception("Failed to send email to %s", email)
+                raise ServerErrors.email_send_failure from e
 
     def send_otp(self, email: str, otp: str):
         subject = f"OTP ({otp})"

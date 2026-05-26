@@ -35,6 +35,7 @@ class CreateRequest(BaseModel):
 
 
 class UpdateRequest(BaseModel):
+    email: Optional[EmailStr] = Field(default=None, description="User Email")
     password: Optional[str] = Field(default=None, description="User password")
     name: Optional[str] = Field(default=None, description="Full name")
     role: Optional[UserRole] = Field(default=None, description="User role")

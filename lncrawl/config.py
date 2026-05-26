@@ -292,9 +292,10 @@ class AppConfig(_Section):
         """Admin Email.
 
         Sign-in email for the built-in administrator account (for example in the web interface).
-        The default is `"admin"`.
+        Must be a valid RFC-5321 address so notification mail can reach the admin; the default
+        `"admin@localhost"` is just a placeholder and should be replaced after install.
         """
-        return self._get("admin_email", "admin")
+        return self._get("admin_email", "admin@localhost")
 
     @admin_email.setter
     def admin_email(self, v: str) -> None:
@@ -522,10 +523,13 @@ class CrawlerConfig(_Section):
     def index_file_download_url(self) -> str:
         """Sources Index Download URL.
 
-        Where the app downloads the official list of site sources from. This is built in and does
-        not appear in your settings file.
+        Where the app downloads the official list of site sources from. Derived from the repo
+        constants in ``lncrawl.utils.github`` so all GitHub-facing URLs stay in sync. This is
+        built in and does not appear in your settings file.
         """
-        return "https://raw.githubusercontent.com/lncrawl/lightnovel-crawler/dev/sources/_index.zip"
+        from .utils.github import GithubClient
+
+        return GithubClient.get_remote_raw_link("sources/_index.zip")
 
     @property
     def ignore_images(self) -> bool:

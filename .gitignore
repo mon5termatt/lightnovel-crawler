@@ -14,6 +14,8 @@ _novel
 *.pyc
 *.pyo
 /.tox
+/data/*
+/internal_docs/*
 /lightnovel-crawler-*
 /logs
 /sqlite.db
@@ -35,3 +37,4 @@ windows/
 config.json
 .claude/settings.local.json
 /rthooks
+/sources/_private/

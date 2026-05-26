@@ -42,9 +42,32 @@ class UserService:
         email = ctx.config.app.admin_email
         password = ctx.config.app.admin_password
         with ctx.db.session() as sess:
-            user = sess.exec(sa.select(User).where(User.email == email).limit(1)).first()
+            # Reconcile any existing admin rows into a single canonical record:
+            #
+            #   1. If a user already has the configured email, that row wins (it may be
+            #      a duplicate admin created by an older buggy seeder that couldn't
+            #      migrate emails). Promote it.
+            #   2. Otherwise, take whatever row currently has the ADMIN role and rename
+            #      its email to the configured value -- this migrates the legacy
+            #      `email="admin"` seed row instead of orphaning it.
+            #   3. Otherwise, create a fresh admin.
+            #
+            # Any *other* admin rows are demoted to USER so we never end up with two
+            # admins. We never delete them, because they may own jobs/libraries.
+            by_email = sess.exec(sa.select(User).where(User.email == email).limit(1)).first()
+            admins = list(
+                sess.exec(sa.select(User).where(User.role == UserRole.ADMIN)).all()
+            )
+
+            if by_email is not None:
+                user = by_email
+            elif admins:
+                user = admins[0]
+            else:
+                user = None
+
             if not user:
-                logger.info("Adding admin user")
+                logger.info("Adding admin user (%s)", email)
                 user = User(
                     email=email,
                     password=self._hash(password),
@@ -55,12 +78,31 @@ class UserService:
                 )
                 sess.add(user)
             else:
-                logger.info("Updating admin user")
+                if user.email != email:
+                    logger.info("Migrating admin email %s -> %s", user.email, email)
+                    user.email = email
+                else:
+                    logger.info("Updating admin user (%s)", email)
                 user.password = self._hash(password)
                 user.role = UserRole.ADMIN
                 user.tier = UserTier.VIP
                 user.is_active = True
-            sess.commit()
+
+            # Demote any stale duplicate admins so only one ADMIN row remains.
+            for other in admins:
+                if other.id != user.id and other.role == UserRole.ADMIN:
+                    logger.warning(
+                        "Demoting duplicate admin %s (%s) to USER", other.email, other.id
+                    )
+                    other.role = UserRole.USER
+
+            try:
+                sess.commit()
+            except IntegrityError as e:
+                sess.rollback()
+                logger.exception("Failed to commit admin user setup")
+                raise ServerErrors.user_exists from e
+            sess.refresh(user)
         self._admin = user
 
     def encode_token(
@@ -215,6 +257,8 @@ class UserService:
             if not user:
                 raise ServerErrors.no_such_user
 
+            if body.email is not None and body.email != user.email:
+                user.email = body.email
             if body.name is not None:
                 user.name = body.name
             if body.password is not None:
@@ -230,7 +274,15 @@ class UserService:
                 extra.update(body.extra)
                 user.extra = extra
 
-            sess.commit()
+            try:
+                sess.commit()
+            except IntegrityError as e:
+                sess.rollback()
+                raise ServerErrors.user_exists from e
+
+            # Keep the cached admin row in sync with the persisted state.
+            if self._admin and self._admin.id == user.id:
+                self._admin = user
 
     def change_password(self, user: User, body: PasswordUpdateRequest) -> None:
         if not self._check(body.old_password, user.password):

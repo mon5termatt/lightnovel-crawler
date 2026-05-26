@@ -3,17 +3,20 @@ from typing import List, Optional
 
 import httpx
 
-from ..context import ctx
 from ..exceptions import ServerErrors
 
 _GITHUB_API = "https://api.github.com"
-_GITHUB_REPO = "lncrawl/lightnovel-crawler"
+_GITHUB_REPO = "mon5termatt/lightnovel-crawler"
 _GITHUB_OWNER = _GITHUB_REPO.split("/")[0]
 _DEFAULT_BRANCH = "dev"
 
 
 class GithubClient:
     def __init__(self) -> None:
+        # Lazy import: utils.github is imported from config (via index_file_download_url)
+        # which is itself loaded by ctx.setup(); a top-level import of ctx would loop.
+        from ..context import ctx
+
         token = ctx.config.app.github_token
         if not token:
             raise ServerErrors.server_error.with_extra("No GitHub Token available")
