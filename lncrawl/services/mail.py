@@ -136,6 +136,11 @@ class MailService:
                 logger.exception("Failed to send email to %s", email)
                 raise ServerErrors.email_send_failure from e
 
+    def send_invite(self, email: str, inviter_name: str, link: str):
+        subject = "Lightnovel Crawler Invitation"
+        body = emails.invite_template().render(inviter_name=inviter_name, link=link)
+        self.send(email, subject, body)
+
     def send_otp(self, email: str, otp: str):
         subject = f"OTP ({otp})"
         body = emails.otp_template().render(otp=otp)
